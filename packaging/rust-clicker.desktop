@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Clicker
+GenericName=Auto Clicker
+Comment=Wayland macro recorder and parallel-device auto clicker
+Exec=rust-clicker
+Icon=rust-clicker
+Terminal=false
+Categories=Utility;
+Keywords=autoclicker;clicker;macro;recorder;input;
+StartupNotify=false

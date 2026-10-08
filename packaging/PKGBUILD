@@ -1,0 +1,49 @@
+# Maintainer: Morvyk <Morvyk@proton.me>
+pkgname=rust-clicker
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Wayland macro recorder and parallel-device auto clicker'
+arch=('x86_64')
+license=('GPL-3.0-or-later')
+# Linked: glibc (libc, libm) and gcc-libs (libgcc_s), from `readelf -d`.
+# Loaded at run time with dlopen: libwayland-client.so.0 (wayland) and
+# libxkbcommon.so.0 (libxkbcommon).
+depends=('glibc' 'gcc-libs' 'wayland' 'libxkbcommon')
+makedepends=('cargo' 'clang' 'mold')
+optdepends=('breeze-icons: toolbar and sidebar icons (any freedesktop icon theme works)')
+options=('!lto')
+# Builds the checkout this PKGBUILD lives in (packaging/ inside the project).
+
+_root() { cd "$startdir/.." ; }
+
+prepare() {
+  _root
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target x86_64-unknown-linux-gnu
+}
+
+build() {
+  _root
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="$srcdir/target"
+  # Replaces the checkout's `-C target-cpu=native` so the package is portable.
+  export RUSTFLAGS='-C link-arg=-fuse-ld=mold'
+  cargo build --frozen --release
+}
+
+check() {
+  _root
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="$srcdir/target"
+  export RUSTFLAGS='-C link-arg=-fuse-ld=mold'
+  cargo test --frozen
+}
+
+package() {
+  _root
+  install -Dm755 "$srcdir/target/release/rust-clicker" "$pkgdir/usr/bin/rust-clicker"
+  install -Dm644 packaging/rust-clicker.desktop "$pkgdir/usr/share/applications/rust-clicker.desktop"
+  install -Dm644 packaging/rust-clicker.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/rust-clicker.svg"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

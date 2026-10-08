@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Clicker</title>
+  <defs>
+    <clipPath id="body">
+      <rect x="92" y="78" width="104" height="150" rx="52"/>
+    </clipPath>
+  </defs>
+  <!-- mouse body -->
+  <rect x="92" y="78" width="104" height="150" rx="52" fill="#eff0f1"/>
+  <!-- pressed left button -->
+  <g clip-path="url(#body)">
+    <rect x="80" y="66" width="52" height="68" fill="#3daee9"/>
+  </g>
+  <!-- outline, button split and wheel -->
+  <rect x="92" y="78" width="104" height="150" rx="52" fill="none" stroke="#31363b" stroke-width="9"/>
+  <path d="M92 134h104M144 78v56" fill="none" stroke="#31363b" stroke-width="8" stroke-linecap="round"/>
+  <rect x="136" y="92" width="16" height="28" rx="8" fill="#31363b"/>
+  <!-- click lines -->
+  <g fill="none" stroke="#3daee9" stroke-width="11" stroke-linecap="round">
+    <path d="M76 52L56 32"/>
+    <path d="M60 80H32"/>
+    <path d="M96 40V12"/>
+  </g>
+</svg>
