@@ -125,30 +125,60 @@ impl ClickerApp {
         self.tip(button, tip)
     }
 
+    /// The binding's key, or a prompt while a new one is being chosen.
+    fn hotkey_label(&self, index: usize) -> String {
+        if self.selecting_hotkey == Some(index) {
+            "Press a key…".into()
+        } else {
+            self.settings
+                .active()
+                .bindings
+                .get(index)
+                .map_or_else(String::new, |binding| key_name(binding.hotkey))
+        }
+    }
+
+    /// A button that shows a binding's key and changes it when clicked.
+    fn hotkey_button(&self, index: usize, flat: bool) -> El<'_> {
+        let c = self.look.c;
+        let mouse = self
+            .settings
+            .active()
+            .bindings
+            .get(index)
+            .is_some_and(|binding| !model::is_keyboard(binding.hotkey));
+        let icon = if mouse { Icon::Mouse } else { Icon::Keyboard };
+        let button = button(self.labelled(icon, self.hotkey_label(index), true))
+            .padding([5, 10])
+            .on_press_maybe(
+                (self.selecting_hotkey == Some(index) || self.idle())
+                    .then_some(Message::SelectHotkey(index)),
+            )
+            .style(style::button_style(c, flat));
+        self.tip(
+            button,
+            "Global shortcut. Click, then press a key or a side mouse button.",
+        )
+    }
+
     fn toolbar(&self) -> El<'_> {
         let l = self.look;
         let c = l.c;
-        let running = self.engine.running();
+        let running = self.running();
         let can_start = self.idle();
-        let key = if self.selecting_hotkey {
-            "Press a key…".to_string()
-        } else {
-            key_name(self.settings.hotkey)
-        };
-        let shortcut = button(self.labelled(Icon::Keyboard, key, true))
-            .padding([5, 10])
-            .on_press_maybe(
-                (self.selecting_hotkey || (!running && !self.recording))
-                    .then_some(Message::SelectHotkey),
-            )
-            .style(style::button_style(c, true));
         container(
             row![
-                self.tool_button(Icon::Start, "Start", Message::Start, can_start, "Start clicking"),
-                self.tool_button(Icon::Stop, "Stop", Message::Stop, running, "Stop clicking"),
+                self.tool_button(
+                    Icon::Start,
+                    "Start",
+                    Message::Start,
+                    can_start,
+                    "Start the macro shown on the Sequence page",
+                ),
+                self.tool_button(Icon::Stop, "Stop", Message::Stop, running, "Stop every macro"),
                 space().width(Length::Fill),
-                muted(l, "Start / stop key"),
-                self.tip(shortcut, "Global shortcut. Click, then press a key to change it."),
+                muted(l, format!("{} · Start / stop key", self.settings.active().name)),
+                self.hotkey_button(self.settings.binding, true),
             ]
             .spacing(4)
             .align_y(Alignment::Center),
@@ -193,6 +223,7 @@ impl ClickerApp {
                     bottom: 14.0,
                     left: 12.0,
                 }),
+                item(Page::Profiles, Icon::Keyboard, "Profiles"),
                 item(Page::Sequence, Icon::Sequence, "Sequence"),
                 item(Page::Playback, Icon::Settings, "Playback"),
                 item(Page::Test, Icon::Test, "Test"),
@@ -266,6 +297,7 @@ impl ClickerApp {
 
     fn page_view(&self) -> El<'_> {
         match self.page {
+            Page::Profiles => self.profiles_page(),
             Page::Sequence => self.sequence_page(),
             Page::Playback => self.playback_page(),
             Page::Test => self.test_page(),
@@ -279,11 +311,140 @@ impl ClickerApp {
             .into()
     }
 
+    // ---------------------------------------------------------------- Profiles
+
+    fn profiles_page(&self) -> El<'_> {
+        let l = self.look;
+        let c = l.c;
+        let editable = self.idle();
+        let mut profiles = Row::new().spacing(4);
+        for (index, profile) in self.settings.profiles.iter().enumerate() {
+            let active = index == self.settings.profile;
+            profiles = profiles.push(
+                button(t(l, profile.name.as_str()))
+                    .padding([4, 10])
+                    .on_press_maybe(editable.then_some(Message::SelectProfile(index)))
+                    .style(style::nav_style(c, active)),
+            );
+        }
+        let profile_actions = row![
+            self.tool_button(Icon::Add, "Add", Message::AddProfile, editable, "Add an empty profile"),
+            self.tool_button(
+                Icon::Delete,
+                "Delete",
+                Message::DeleteProfile,
+                editable && self.settings.profiles.len() > 1,
+                "Delete the active profile",
+            ),
+        ]
+        .spacing(2);
+        let name = text_input("Profile name", &self.settings.active().name)
+            .on_input(Message::RenameProfile)
+            .size(l.size)
+            .font(l.font)
+            .padding([4, 8])
+            .width(240)
+            .style(style::text_input_style(c));
+        let bindings = &self.settings.active().bindings;
+        let mut keys = Column::new();
+        for (index, binding) in bindings.iter().enumerate() {
+            let running = self.engines.get(index).is_some_and(Engine::running);
+            let steps = match binding.steps.len() {
+                1 => "1 step".to_string(),
+                n => format!("{n} steps"),
+            };
+            let hold = checkbox(binding.hold)
+                .label("Hold to play")
+                .on_toggle_maybe(editable.then_some(move |hold| Message::SetHold(index, hold)))
+                .size(16)
+                .text_size(l.size)
+                .font(l.font)
+                .style(style::checkbox_style(c));
+            let (toggle_icon, toggle_label, toggle_tip) = if running {
+                (Icon::Stop, "Stop", "Stop this macro")
+            } else {
+                (Icon::Start, "Start", "Start this macro")
+            };
+            let line = row![
+                container(self.hotkey_button(index, false)).width(170),
+                container(hold).width(130),
+                small(l, steps),
+                space().width(Length::Fill),
+                self.tool_button(
+                    toggle_icon,
+                    toggle_label,
+                    Message::ToggleBinding(index),
+                    running || (!self.recording && self.selecting_hotkey.is_none()),
+                    toggle_tip,
+                ),
+                self.tool_button(
+                    Icon::Edit,
+                    "Edit",
+                    Message::EditBinding(index),
+                    editable,
+                    "Record or edit this key's sequence",
+                ),
+                self.tool_button(
+                    Icon::Delete,
+                    "Remove",
+                    Message::RemoveBinding(index),
+                    editable && bindings.len() > 1,
+                    "Remove this key and its sequence",
+                ),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center);
+            keys = keys.push(
+                container(line)
+                    .padding([4, 10])
+                    .width(Length::Fill)
+                    .style(move |_| style::row(c, false, false, index % 2 == 1)),
+            );
+        }
+        let keys = container(scrollable(keys).style(style::scrollable_style(c)))
+            .padding(1)
+            .width(Length::Fill)
+            .style(move |_| style::view_area(c));
+        let form = column![
+            self.form_section("Profile"),
+            self.form_row("Active profile:", column![profiles.wrap(), profile_actions].spacing(6)),
+            self.form_row("Name:", name),
+            self.form_hint("Only the active profile's keys are listened for."),
+            space().height(8),
+            self.form_section("Keys"),
+        ]
+        .spacing(10)
+        .max_width(640);
+        column![
+            self.page_header(
+                "Profiles",
+                "Give each key its own macro, and keep several sets of keys".into(),
+            ),
+            space().height(8),
+            form,
+            keys,
+            row![
+                self.tool_button(Icon::Add, "Add key", Message::AddBinding, editable, "Add a key with its own macro"),
+                small(
+                    l,
+                    "Press a key once to start its macro and again to stop it, or tick Hold to play only while it is held.",
+                ),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(10)
+        .padding(16)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
     // ---------------------------------------------------------------- Sequence
 
     fn sequence_page(&self) -> El<'_> {
         let editable = self.idle();
-        let steps = self.settings.steps.len();
+        let steps = self.settings.current().steps.len();
         let (record_icon, record_label) = if self.recording {
             (Icon::Stop, "Finish")
         } else {
@@ -302,15 +463,31 @@ impl ClickerApp {
         .spacing(2)
         .height(Length::Shrink)
         .align_y(Alignment::Center);
+        let key = key_name(self.settings.current().hotkey);
         let subtitle = match steps {
-            0 => "No steps".to_string(),
-            1 => "1 step · Click a key or delay to edit".to_string(),
-            n => format!("{n} steps · Click a key or delay to edit"),
+            0 => format!("Macro for {key} · No steps"),
+            1 => format!("Macro for {key} · 1 step · Click a key or delay to edit"),
+            n => format!("Macro for {key} · {n} steps · Click a key or delay to edit"),
         };
         let mut page = Column::new()
             .spacing(10)
-            .push(self.page_header("Sequence", subtitle))
-            .push(actions);
+            .push(self.page_header("Sequence", subtitle));
+        let bindings = &self.settings.active().bindings;
+        if bindings.len() > 1 {
+            let c = self.look.c;
+            let mut keys = Row::new().spacing(4);
+            for (index, binding) in bindings.iter().enumerate() {
+                let shown = index == self.settings.binding;
+                keys = keys.push(
+                    button(t(self.look, key_name(binding.hotkey)))
+                        .padding([4, 10])
+                        .on_press_maybe((editable || shown).then_some(Message::EditBinding(index)))
+                        .style(style::nav_style(c, shown)),
+                );
+            }
+            page = page.push(keys.wrap());
+        }
+        let mut page = page.push(actions);
         if self.recording {
             page = page.push(self.recording_banner());
         }
@@ -341,7 +518,7 @@ impl ClickerApp {
     fn sequence_list(&self) -> El<'_> {
         let l = self.look;
         let c = l.c;
-        let steps = self.settings.steps.len();
+        let steps = self.settings.current().steps.len();
         let body: El = if steps == 0 {
             self.placeholder()
         } else {
@@ -368,7 +545,7 @@ impl ClickerApp {
                     .push(space().height(first as f32 * ROW_HEIGHT))
                     .width(Length::Fill);
                 for index in first..last {
-                    rows = rows.push(self.step_row(index, &self.settings.steps[index]));
+                    rows = rows.push(self.step_row(index, &self.settings.current().steps[index]));
                 }
                 rows = rows.push(space().height((steps - last) as f32 * ROW_HEIGHT));
                 scrollable(rows)
@@ -602,7 +779,7 @@ impl ClickerApp {
     fn playback_page(&self) -> El<'_> {
         let l = self.look;
         let c = l.c;
-        let editable = !self.engine.running() && !self.recording;
+        let editable = !self.running() && !self.recording;
         let loop_slider = slider(
             0..=2000u32,
             self.settings.loop_delay_ms as u32,
@@ -637,17 +814,6 @@ impl ClickerApp {
             .text_size(l.size)
             .font(l.font)
             .style(style::checkbox_style(c));
-        let key = if self.selecting_hotkey {
-            "Press a key…".to_string()
-        } else {
-            key_name(self.settings.hotkey)
-        };
-        let hotkey = button(self.labelled(Icon::Keyboard, key, true))
-            .padding([5, 12])
-            .on_press_maybe(
-                (self.selecting_hotkey || editable).then_some(Message::SelectHotkey),
-            )
-            .style(style::button_style(c, false));
         let form = column![
             self.form_section("Timing"),
             self.form_row(
@@ -675,13 +841,13 @@ impl ClickerApp {
             self.form_hint("Each virtual device plays the sequence independently."),
             space().height(8),
             self.form_section("Shortcut"),
-            self.form_row("Start / stop key:", hotkey),
-            self.form_hint("Works in every application. Click, then press a key."),
+            self.form_row("Start / stop key:", self.hotkey_button(self.settings.binding, false)),
+            self.form_hint("For the shown macro. Set up more keys on the Profiles page."),
         ]
         .spacing(10)
         .max_width(640);
         column![
-            self.page_header("Playback", "How the sequence is played back".into()),
+            self.page_header("Playback", "How every macro is played back".into()),
             space().height(8),
             form,
         ]
@@ -716,8 +882,8 @@ impl ClickerApp {
         let l = self.look;
         let c = l.c;
         let now = Instant::now();
-        let overruns = self.engine.state.test_overruns.load(Ordering::Relaxed);
-        let key = key_name(self.settings.hotkey);
+        let overruns = self.test_overruns();
+        let key = key_name(self.settings.current().hotkey);
         let hint = if overruns > 0 {
             text(format!("{overruns} input overruns: CPS is a lower bound"))
                 .size(l.size - 1.0)
@@ -842,19 +1008,30 @@ impl ClickerApp {
     fn status_bar(&self) -> El<'_> {
         let l = self.look;
         let c = l.c;
+        let running: Vec<_> = self.engines.iter().filter(|engine| engine.running()).collect();
         let (status, tone) = if self.recording {
             ("Recording", c.error)
-        } else if !self.engine.running() {
+        } else if running.is_empty() {
             ("Idle", c.muted)
-        } else if self.engine.state.cancel.is_stopped() {
+        } else if running.iter().all(|engine| engine.state.cancel.is_stopped()) {
             ("Stopping", c.neutral)
-        } else if self.engine.state.ready.load(Ordering::Acquire) {
+        } else if running.iter().any(|engine| {
+            engine.state.ready.load(Ordering::Acquire) && !engine.state.cancel.is_stopped()
+        }) {
             ("Running", c.positive)
         } else {
             ("Starting", c.neutral)
         };
+        let keys = self
+            .settings
+            .active()
+            .bindings
+            .iter()
+            .map(|binding| key_name(binding.hotkey))
+            .collect::<Vec<_>>()
+            .join(", ");
         let devices = self.input.status();
-        let loops = self.engine.state.loops.load(Ordering::Relaxed);
+        let loops = self.loops();
         let detail = format!(
             "{} input devices, {} inaccessible · Wayland",
             devices.connected, devices.denied
@@ -862,7 +1039,7 @@ impl ClickerApp {
         container(
             row![
                 text(status).size(l.size - 1.0).font(bold(l)).color(tone),
-                small(l, format!("{} to start / stop", key_name(self.settings.hotkey))),
+                small(l, format!("{} · {keys}", self.settings.active().name)),
                 space().width(Length::Fill),
                 small(l, format!("{loops} loops")),
                 vsep(l),

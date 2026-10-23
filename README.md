@@ -9,6 +9,14 @@ The interface is written with [iced](https://iced.rs) and follows your KDE
 (or GTK) colors, fonts and icon theme. Playback goes through `uinput`, so it
 works in any Wayland application.
 
+## Profiles
+
+A profile is a set of keys, each with its own macro: for example Space on
+the side mouse button and E on the extra button. Each key starts and stops
+its macro independently, so several can run at once. Tick *Hold to play* to
+run a macro only while its key is held down. Only the active profile's keys
+are listened for; switch profiles on the Profiles page.
+
 ## Build
 
 Requires Rust 1.88 or newer and a Wayland session.

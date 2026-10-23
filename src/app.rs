@@ -18,7 +18,7 @@ use crate::{
     engine::Engine,
     icons::Icons,
     input::{self, InputMonitor},
-    model::{self, Recorder, Settings, Step, format_ms, key_name},
+    model::{self, Binding, Profile, Recorder, Settings, Step, format_ms, key_name},
     theme::{Appearance, Look, system_appearance},
 };
 
@@ -29,6 +29,7 @@ const EDIT_ID: &str = "edit_delay";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
+    Profiles,
     Sequence,
     Playback,
     Test,
@@ -80,12 +81,22 @@ pub enum Message {
     // Playback.
     Start,
     Stop,
+    ToggleBinding(usize),
     SetParallel(bool),
     SetLoopDelay(u32),
     LoopDelayText(String),
     SetDevices(u32),
     DevicesText(String),
-    SelectHotkey,
+    SelectHotkey(usize),
+    // Profiles.
+    SelectProfile(usize),
+    AddProfile,
+    DeleteProfile,
+    RenameProfile(String),
+    AddBinding,
+    RemoveBinding(usize),
+    SetHold(usize, bool),
+    EditBinding(usize),
     // Sequence.
     Record,
     Clear,
@@ -156,13 +167,16 @@ impl CpsMeter {
 
 pub struct ClickerApp {
     settings: Settings,
-    engine: Engine,
+    /// One engine per binding of the active profile, so each key's macro runs
+    /// on its own.
+    engines: Vec<Engine>,
     input: InputMonitor,
     page: Page,
     recording: bool,
     recorder: Recorder,
     record_started: Duration,
-    selecting_hotkey: bool,
+    /// The binding whose hotkey the next key press sets.
+    selecting_hotkey: Option<usize>,
     editing: Option<Edit>,
     selected: Option<usize>,
     hovered_row: Option<usize>,
@@ -206,8 +220,7 @@ impl ClickerApp {
 
     fn from_settings(mut settings: Settings) -> Self {
         settings.sanitize();
-        let engine = Engine::default();
-        let input = InputMonitor::new(settings.hotkey, engine.state.clone());
+        let input = InputMonitor::new();
         let key_choices = (1..=model::MAX_KEY)
             .filter(|code| {
                 let name = format!("{:?}", KeyCode::new(*code));
@@ -220,17 +233,17 @@ impl ClickerApp {
             .collect();
         let appearance = Appearance::default();
         let look = Look::new(&appearance, true);
-        Self {
+        let mut app = Self {
             loop_text: settings.loop_delay_ms.to_string(),
             devices_text: settings.devices.to_string(),
             settings,
-            engine,
+            engines: Vec::new(),
             input,
             page: Page::Sequence,
             recording: false,
             recorder: Recorder::default(),
             record_started: Duration::ZERO,
-            selecting_hotkey: false,
+            selecting_hotkey: None,
             editing: None,
             selected: None,
             hovered_row: None,
@@ -255,7 +268,85 @@ impl ClickerApp {
             polling: false,
             dirty: false,
             last_save: Instant::now(),
+        };
+        app.sync_bindings();
+        app
+    }
+
+    /// Matches the engines and the listened-for hotkeys to the active profile.
+    /// Bindings only change while idle, so no dropped engine is still running.
+    fn sync_bindings(&mut self) {
+        let bindings = &self.settings.active().bindings;
+        self.engines.resize_with(bindings.len(), Engine::default);
+        *self
+            .input
+            .state
+            .bindings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = bindings
+            .iter()
+            .zip(&self.engines)
+            .map(|(binding, engine)| (binding.hotkey, binding.hold, engine.state.clone()))
+            .collect();
+    }
+
+    fn running(&self) -> bool {
+        self.engines.iter().any(Engine::running)
+    }
+
+    fn stop_all(&self) {
+        for engine in &self.engines {
+            engine.stop();
         }
+    }
+
+    fn loops(&self) -> u64 {
+        self.engines
+            .iter()
+            .map(|engine| engine.state.loops.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    fn test_clicks(&self) -> u64 {
+        self.engines
+            .iter()
+            .map(|engine| engine.state.test_clicks.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    fn test_overruns(&self) -> u64 {
+        self.engines
+            .iter()
+            .map(|engine| engine.state.test_overruns.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// The first of F6–F12 that no binding of the active profile uses yet.
+    fn free_hotkey(&self) -> u16 {
+        let used = |code: u16| self.settings.active().bindings.iter().any(|b| b.hotkey == code);
+        [
+            KeyCode::KEY_F6,
+            KeyCode::KEY_F7,
+            KeyCode::KEY_F8,
+            KeyCode::KEY_F9,
+            KeyCode::KEY_F10,
+            KeyCode::KEY_F11,
+            KeyCode::KEY_F12,
+        ]
+        .into_iter()
+        .map(KeyCode::code)
+        .find(|code| !used(*code))
+        .unwrap_or(KeyCode::KEY_F6.code())
+    }
+
+    /// Shows another binding's sequence.
+    fn show_binding(&mut self, index: usize) {
+        self.end_edit();
+        self.settings.binding = index;
+        self.selected = None;
+        self.hovered_row = None;
+        self.scroll_y = 0.0;
+        self.dirty = true;
     }
 
     pub fn title(&self) -> String {
@@ -274,7 +365,7 @@ impl ClickerApp {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        let busy = self.recording || self.engine.running() || self.page == Page::Test;
+        let busy = self.recording || self.running() || self.page == Page::Test;
         let poll = Duration::from_millis(if busy { 16 } else { 50 });
         Subscription::batch([
             time::every(poll).map(|_| Message::Tick),
@@ -329,16 +420,29 @@ impl ClickerApp {
         )
     }
 
-    fn start(&mut self) {
-        if self.recording || self.selecting_hotkey {
+    fn start(&mut self, binding: usize) {
+        if self.recording || self.selecting_hotkey.is_some() {
             return;
         }
         self.editing = None;
-        self.error = self.engine.start(&self.settings).err();
+        if let (Some(engine), Some(macro_)) = (
+            self.engines.get_mut(binding),
+            self.settings.active().bindings.get(binding),
+        ) {
+            self.error = engine.start(&self.settings, &macro_.steps).err();
+        }
+    }
+
+    fn toggle(&mut self, binding: usize) {
+        match self.engines.get(binding) {
+            Some(engine) if engine.running() => engine.stop(),
+            Some(_) => self.start(binding),
+            None => {}
+        }
     }
 
     fn start_recording(&mut self) {
-        self.settings.steps.clear();
+        self.settings.current_mut().steps.clear();
         self.recorder = Recorder::default();
         self.record_started = timestamp();
         self.recording = true;
@@ -350,12 +454,13 @@ impl ClickerApp {
 
     fn finish_recording(&mut self) {
         self.recording = false;
-        self.recorder.finish(&mut self.settings.steps, timestamp());
+        self.recorder
+            .finish(&mut self.settings.current_mut().steps, timestamp());
         self.sync_input_mode();
     }
 
     fn sync_input_mode(&self) {
-        let mode = if self.selecting_hotkey {
+        let mode = if self.selecting_hotkey.is_some() {
             input::SELECT_HOTKEY
         } else if self.editing.as_ref().is_some_and(|edit| edit.capture) {
             input::SELECT_STEP
@@ -369,12 +474,12 @@ impl ClickerApp {
 
     /// True while Clicker itself may change the sequence or settings.
     fn idle(&self) -> bool {
-        !self.recording && !self.engine.running() && !self.selecting_hotkey
+        !self.recording && !self.running() && self.selecting_hotkey.is_none()
     }
 
     /// Starts editing a cell in place; returns the focus task for text cells.
     fn begin_edit(&mut self, index: usize, _requested: Field) -> Task<Message> {
-        let Some(step) = self.settings.steps.get(index) else {
+        let Some(step) = self.settings.current().steps.get(index) else {
             return Task::none();
         };
         let (delay_edit, code, delay_text) = match step {
@@ -406,13 +511,19 @@ impl ClickerApp {
     }
 
     fn receive_input(&mut self) {
-        self.engine
-            .state
-            .gui_hovered
-            .store(self.cursor_in_window, Ordering::Relaxed);
         let testing = self.in_pad && self.page == Page::Test;
-        self.engine.state.testing.store(testing, Ordering::Relaxed);
-        let observed = self.engine.state.test_clicks.load(Ordering::Relaxed);
+        for engine in &mut self.engines {
+            engine
+                .state
+                .gui_hovered
+                .store(self.cursor_in_window, Ordering::Relaxed);
+            engine.state.testing.store(testing, Ordering::Relaxed);
+            engine.reap();
+            if let Some(error) = engine.take_error() {
+                self.error = Some(error);
+            }
+        }
+        let observed = self.test_clicks();
         self.cps
             .record(observed.saturating_sub(self.cps_observed), Instant::now());
         self.cps_observed = observed;
@@ -422,19 +533,22 @@ impl ClickerApp {
             self.recording && currently_in_area,
             Ordering::Release,
         );
-        self.engine.reap();
-        if let Some(error) = self.engine.take_error() {
-            self.error = Some(error);
-        }
         while let Ok(message) = self.input.messages.try_recv() {
             match message {
-                input::Message::Toggle { stop_only } => {
-                    if stop_only || self.engine.running() {
-                        self.engine.stop();
+                input::Message::Toggle { binding, stop_only } => {
+                    if stop_only {
+                        if let Some(engine) = self.engines.get(binding) {
+                            engine.stop();
+                        }
                     } else {
-                        self.start();
+                        self.toggle(binding);
                     }
                 }
+                input::Message::Hold { binding, pressed } => match self.engines.get(binding) {
+                    Some(engine) if !pressed => engine.stop(),
+                    Some(engine) if !engine.running() => self.start(binding),
+                    _ => {}
+                },
                 input::Message::Key {
                     code,
                     pressed,
@@ -443,18 +557,19 @@ impl ClickerApp {
                     in_area,
                 } => {
                     if mode == input::SELECT_HOTKEY
-                        && self.selecting_hotkey
                         && pressed
-                        && model::is_keyboard(code)
+                        && model::is_hotkey(code)
+                        && let Some(index) = self.selecting_hotkey.take()
                     {
-                        self.settings.hotkey = code;
-                        self.input.state.hotkey.store(code, Ordering::Relaxed);
-                        self.selecting_hotkey = false;
+                        if let Some(binding) = self.settings.active_mut().bindings.get_mut(index) {
+                            binding.hotkey = code;
+                        }
+                        self.sync_bindings();
                         self.dirty = true;
                         self.sync_input_mode();
                     } else if mode == input::SELECT_STEP && pressed {
                         if let Some(edit) = self.editing.take_if(|edit| edit.capture)
-                            && let Some(step) = self.settings.steps.get_mut(edit.index)
+                            && let Some(step) = self.settings.current_mut().steps.get_mut(edit.index)
                         {
                             *step = match step {
                                 Step::Release(_) => Step::Release(code),
@@ -469,10 +584,10 @@ impl ClickerApp {
                         && ((in_area && currently_in_area)
                             || (!pressed && self.recorder.holds(code)))
                     {
-                        self.recorder
-                            .record(&mut self.settings.steps, code, pressed, at);
+                        let steps = &mut self.settings.current_mut().steps;
+                        self.recorder.record(steps, code, pressed, at);
                         self.dirty = true;
-                        if self.settings.steps.len() >= 100_000 {
+                        if steps.len() >= 100_000 {
                             self.finish_recording();
                             self.error =
                                 Some("Recording reached 100,000 steps and was stopped.".into());
@@ -492,7 +607,7 @@ impl ClickerApp {
     }
 
     fn tick(&mut self) -> Task<Message> {
-        let steps_before = self.settings.steps.len();
+        let steps_before = self.settings.current().steps.len();
         self.receive_input();
         let now = Instant::now();
         self.cps.prune(now);
@@ -500,6 +615,7 @@ impl ClickerApp {
         if self.dirty && self.last_save.elapsed() >= Duration::from_secs(1) {
             self.save();
         }
+        let loops = self.loops();
         if let Some(last) = &mut self.diagnostics
             && last.elapsed() >= Duration::from_secs(1)
         {
@@ -507,13 +623,14 @@ impl ClickerApp {
                 "clicker: received_clicks={} cps={} completed_loops={}",
                 self.cps.total,
                 self.cps.current,
-                self.engine.state.loops.load(Ordering::Relaxed)
+                loops
             );
             *last = Instant::now();
         }
         // Follow the newest step while recording.
-        if self.recording && self.settings.steps.len() != steps_before {
-            let end = self.settings.steps.len() as f32 * ROW_HEIGHT;
+        let steps = self.settings.current().steps.len();
+        if self.recording && steps != steps_before {
+            let end = steps as f32 * ROW_HEIGHT;
             self.scroll_y = end;
             return operation::scroll_to(
                 iced::widget::Id::new(STEPS_ID),
@@ -529,7 +646,7 @@ impl ClickerApp {
         let mut settings = self.settings.clone();
         if self.recording {
             let mut held = std::collections::BTreeSet::new();
-            for step in &settings.steps {
+            for step in &settings.current().steps {
                 match step {
                     Step::Press(code) => {
                         held.insert(*code);
@@ -540,7 +657,10 @@ impl ClickerApp {
                     _ => {}
                 }
             }
-            settings.steps.extend(held.into_iter().map(Step::Release));
+            settings
+                .current_mut()
+                .steps
+                .extend(held.into_iter().map(Step::Release));
         }
         settings
     }
@@ -561,7 +681,7 @@ impl ClickerApp {
             Message::Tick => return self.tick(),
             Message::Noop => {}
             Message::Close => {
-                self.engine.stop();
+                self.stop_all();
                 self.save();
                 return iced::exit();
             }
@@ -598,8 +718,9 @@ impl ClickerApp {
                 }
             }
             Message::Escape | Message::Enter => self.end_edit(),
-            Message::Start => self.start(),
-            Message::Stop => self.engine.stop(),
+            Message::Start => self.start(self.settings.binding),
+            Message::Stop => self.stop_all(),
+            Message::ToggleBinding(index) => self.toggle(index),
             Message::SetParallel(parallel) => {
                 self.settings.parallel = parallel;
                 self.dirty = true;
@@ -628,9 +749,80 @@ impl ClickerApp {
                 }
                 self.devices_text = text;
             }
-            Message::SelectHotkey => {
-                self.selecting_hotkey = !self.selecting_hotkey;
+            Message::SelectHotkey(index) => {
+                if self.selecting_hotkey.is_some() {
+                    self.selecting_hotkey = None;
+                } else if self.idle() {
+                    self.selecting_hotkey = Some(index);
+                }
                 self.sync_input_mode();
+            }
+            Message::SelectProfile(index) => {
+                if self.idle() && index < self.settings.profiles.len() {
+                    self.settings.profile = index;
+                    self.show_binding(0);
+                    self.sync_bindings();
+                }
+            }
+            Message::AddProfile => {
+                if self.idle() {
+                    let name = format!("Profile {}", self.settings.profiles.len() + 1);
+                    self.settings.profiles.push(Profile::new(name));
+                    self.settings.profile = self.settings.profiles.len() - 1;
+                    self.show_binding(0);
+                    self.sync_bindings();
+                }
+            }
+            Message::DeleteProfile => {
+                if self.idle() && self.settings.profiles.len() > 1 {
+                    self.settings.profiles.remove(self.settings.profile);
+                    self.settings.profile =
+                        self.settings.profile.min(self.settings.profiles.len() - 1);
+                    self.show_binding(0);
+                    self.sync_bindings();
+                }
+            }
+            Message::RenameProfile(name) => {
+                self.settings.active_mut().name = name;
+                self.dirty = true;
+            }
+            Message::AddBinding => {
+                if self.idle() {
+                    let binding = Binding {
+                        hotkey: self.free_hotkey(),
+                        ..Binding::default()
+                    };
+                    self.settings.active_mut().bindings.push(binding);
+                    self.sync_bindings();
+                    self.dirty = true;
+                }
+            }
+            Message::RemoveBinding(index) => {
+                let count = self.settings.active().bindings.len();
+                if self.idle() && count > 1 && index < count {
+                    self.settings.active_mut().bindings.remove(index);
+                    let current = self.settings.binding;
+                    let current = if current > index { current - 1 } else { current };
+                    self.show_binding(current.min(count - 2));
+                    self.sync_bindings();
+                }
+            }
+            Message::SetHold(index, hold) => {
+                if self.idle()
+                    && let Some(binding) = self.settings.active_mut().bindings.get_mut(index)
+                {
+                    binding.hold = hold;
+                    self.sync_bindings();
+                    self.dirty = true;
+                }
+            }
+            Message::EditBinding(index) => {
+                if index < self.settings.active().bindings.len()
+                    && (self.idle() || index == self.settings.binding)
+                {
+                    self.show_binding(index);
+                    self.page = Page::Sequence;
+                }
             }
             Message::Record => {
                 if self.recording {
@@ -641,7 +833,7 @@ impl ClickerApp {
                 self.dirty = true;
             }
             Message::Clear => {
-                self.settings.steps.clear();
+                self.settings.current_mut().steps.clear();
                 self.selected = None;
                 self.scroll_y = 0.0;
                 self.dirty = true;
@@ -664,7 +856,7 @@ impl ClickerApp {
             }
             Message::ToggleKind(index) => {
                 if self.idle()
-                    && let Some(step) = self.settings.steps.get_mut(index)
+                    && let Some(step) = self.settings.current_mut().steps.get_mut(index)
                 {
                     *step = match step {
                         Step::Press(code) => Step::Release(*code),
@@ -687,7 +879,7 @@ impl ClickerApp {
             Message::DismissError => self.error = None,
             Message::EditKey(choice) => {
                 if let Some(edit) = self.editing.take()
-                    && let Some(step) = self.settings.steps.get_mut(edit.index)
+                    && let Some(step) = self.settings.current_mut().steps.get_mut(edit.index)
                 {
                     *step = match step {
                         Step::Release(_) => Step::Release(choice.code),
@@ -702,7 +894,7 @@ impl ClickerApp {
                     if let Ok(ms) = text.trim().parse::<f64>()
                         && ms.is_finite()
                         && (0.0..=3_600_000.0).contains(&ms)
-                        && let Some(step) = self.settings.steps.get_mut(edit.index)
+                        && let Some(step) = self.settings.current_mut().steps.get_mut(edit.index)
                     {
                         *step = Step::Delay((ms * 1000.0).round() as u64);
                         self.dirty = true;
@@ -738,8 +930,10 @@ impl ClickerApp {
             Message::PadPress => self.cps.record(1, Instant::now()),
             Message::ResetCps => {
                 self.cps = CpsMeter::default();
-                self.cps_observed = self.engine.state.test_clicks.load(Ordering::Relaxed);
-                self.engine.state.test_overruns.store(0, Ordering::Relaxed);
+                self.cps_observed = self.test_clicks();
+                for engine in &self.engines {
+                    engine.state.test_overruns.store(0, Ordering::Relaxed);
+                }
             }
         }
         Task::none()
@@ -748,7 +942,7 @@ impl ClickerApp {
 
 impl Drop for ClickerApp {
     fn drop(&mut self) {
-        self.engine.stop();
+        self.stop_all();
         if self.dirty {
             self.save();
         }
@@ -810,14 +1004,14 @@ mod tests {
         let mut app = ClickerApp::from_settings(Settings::default());
         let _ = app.update(Message::PadEntered);
         let _ = app.update(Message::Tick);
-        assert!(!app.engine.state.testing.load(Ordering::Relaxed));
+        assert!(!app.engines[0].state.testing.load(Ordering::Relaxed));
         let _ = app.update(Message::Navigate(Page::Test));
         let _ = app.update(Message::PadEntered);
         let _ = app.update(Message::Tick);
-        assert!(app.engine.state.testing.load(Ordering::Relaxed));
+        assert!(app.engines[0].state.testing.load(Ordering::Relaxed));
         let _ = app.update(Message::Navigate(Page::Sequence));
         let _ = app.update(Message::Tick);
-        assert!(!app.engine.state.testing.load(Ordering::Relaxed));
+        assert!(!app.engines[0].state.testing.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -825,24 +1019,45 @@ mod tests {
         let mut app = ClickerApp::from_settings(Settings::default());
         let _ = app.update(Message::EditField(1, Field::Delay));
         let _ = app.update(Message::EditDelayText("1.5".into()));
-        assert_eq!(app.settings.steps[1], Step::Delay(1500));
+        assert_eq!(app.settings.current().steps[1], Step::Delay(1500));
         let _ = app.update(Message::EditDelayText("abc".into()));
-        assert_eq!(app.settings.steps[1], Step::Delay(1500), "keeps the last valid delay");
+        assert_eq!(app.settings.current().steps[1], Step::Delay(1500), "keeps the last valid delay");
         let _ = app.update(Message::EndEdit);
         assert!(app.editing.is_none());
         let _ = app.update(Message::ToggleKind(0));
-        assert!(matches!(app.settings.steps[0], Step::Release(_)));
+        assert!(matches!(app.settings.current().steps[0], Step::Release(_)));
         let key = KeyChoice { code: 30, name: "A".into() };
         let _ = app.update(Message::EditField(2, Field::Key));
         let _ = app.update(Message::EditKey(key));
-        assert_eq!(app.settings.steps[2], Step::Release(30));
+        assert_eq!(app.settings.current().steps[2], Step::Release(30));
         assert!(app.editing.is_none());
+    }
+
+    #[test]
+    fn bindings_get_their_own_engine_and_profiles_switch_them() {
+        let mut app = ClickerApp::from_settings(Settings::default());
+        let _ = app.update(Message::AddBinding);
+        assert_eq!(app.engines.len(), 2);
+        let hotkeys: Vec<u16> = app.settings.active().bindings.iter().map(|b| b.hotkey).collect();
+        assert_eq!(hotkeys, [KeyCode::KEY_F6.code(), KeyCode::KEY_F7.code()]);
+        assert_eq!(app.input.state.bindings.lock().unwrap().len(), 2);
+        let _ = app.update(Message::EditBinding(1));
+        let _ = app.update(Message::Clear);
+        assert!(app.settings.current().steps.is_empty());
+        assert!(!app.settings.active().bindings[0].steps.is_empty());
+        let _ = app.update(Message::AddProfile);
+        assert_eq!((app.settings.profile, app.engines.len()), (1, 1));
+        let _ = app.update(Message::SelectProfile(0));
+        assert_eq!(app.engines.len(), 2);
+        let _ = app.update(Message::RemoveBinding(0));
+        assert_eq!((app.engines.len(), app.settings.binding), (1, 0));
+        assert!(app.settings.current().steps.is_empty());
     }
 
     #[test]
     fn every_page_and_the_dialog_build_a_view() {
         let mut app = ClickerApp::from_settings(Settings::default());
-        for page in [Page::Sequence, Page::Playback, Page::Test] {
+        for page in [Page::Profiles, Page::Sequence, Page::Playback, Page::Test] {
             let _ = app.update(Message::Navigate(page));
             let _ = app.view();
         }

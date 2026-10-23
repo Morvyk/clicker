@@ -89,12 +89,12 @@ impl Engine {
         self.state.running.load(Ordering::Acquire)
     }
 
-    pub fn start(&mut self, settings: &Settings) -> Result<(), String> {
+    pub fn start(&mut self, settings: &Settings, steps: &[Step]) -> Result<(), String> {
         self.reap();
         if self.coordinator.is_some() {
             return Err("Playback is still stopping. Try again in a moment.".into());
         }
-        validate(&settings.steps)?;
+        validate(steps)?;
         self.state.cancel.reset();
         self.state.loops.store(0, Ordering::Relaxed);
         self.state.ready.store(false, Ordering::Release);
@@ -102,10 +102,11 @@ impl Engine {
         self.state.running.store(true, Ordering::Release);
         let state = self.state.clone();
         let settings = settings.clone();
+        let steps: Arc<[Step]> = steps.into();
         match thread::Builder::new()
             .name("playback".into())
             .spawn(move || {
-                run_devices(&settings, &state);
+                run_devices(&settings, steps, &state);
                 state.ready.store(false, Ordering::Release);
                 state.running.store(false, Ordering::Release);
             }) {
@@ -179,14 +180,14 @@ fn make_device(index: usize, steps: &[Step]) -> io::Result<VirtualDevice> {
         .build()
 }
 
-fn run_devices(settings: &Settings, state: &Arc<PlaybackState>) {
+fn run_devices(settings: &Settings, steps: Arc<[Step]>, state: &Arc<PlaybackState>) {
     let mut devices = Vec::new();
     let mut probes = Vec::new();
     for index in 0..settings.device_count() {
         if state.cancel.is_stopped() {
             return;
         }
-        match make_device(index, &settings.steps) {
+        match make_device(index, &steps) {
             Ok(mut device) => match crate::tester::Probe::open(&mut device) {
                 Ok(probe) => {
                     probes.push(Arc::new(Mutex::new(probe)));
@@ -230,7 +231,6 @@ fn run_devices(settings: &Settings, state: &Arc<PlaybackState>) {
         return;
     }
     state.ready.store(true, Ordering::Release);
-    let steps: Arc<[Step]> = settings.steps.clone().into();
     let mut workers = Vec::new();
     for (index, (device, probe)) in devices.into_iter().zip(probes).enumerate() {
         let steps = steps.clone();
@@ -573,13 +573,13 @@ mod tests {
             loop_delay_ms: 0,
             parallel: true,
             devices: 50,
-            steps: vec![
-                Step::Press(KeyCode::BTN_LEFT.code()),
-                Step::Release(KeyCode::BTN_LEFT.code()),
-            ],
             ..Settings::default()
         };
-        engine.start(&settings).unwrap();
+        let steps = [
+            Step::Press(KeyCode::BTN_LEFT.code()),
+            Step::Release(KeyCode::BTN_LEFT.code()),
+        ];
+        engine.start(&settings, &steps).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while !engine.state.ready.load(Ordering::Acquire) {
             assert!(engine.running(), "{:?}", engine.take_error());

@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread::{self, JoinHandle},
@@ -28,8 +28,15 @@ pub enum Message {
         mode: u8,
         in_area: bool,
     },
+    /// A hotkey of the binding at this index was pressed.
     Toggle {
+        binding: usize,
         stop_only: bool,
+    },
+    /// The hotkey of a hold-to-play binding was pressed or released.
+    Hold {
+        binding: usize,
+        pressed: bool,
     },
 }
 
@@ -40,7 +47,9 @@ pub struct DeviceStatus {
 }
 
 pub struct InputState {
-    pub hotkey: AtomicU16,
+    /// Each binding's hotkey, whether it plays only while held, and the
+    /// playback it controls, by binding index.
+    pub bindings: Mutex<Vec<(u16, bool, Arc<PlaybackState>)>>,
     pub mode: AtomicU8,
     pub in_area: AtomicBool,
     pub overflow: AtomicBool,
@@ -55,9 +64,9 @@ pub struct InputMonitor {
 }
 
 impl InputMonitor {
-    pub fn new(hotkey: u16, playback: Arc<PlaybackState>) -> Self {
+    pub fn new() -> Self {
         let state = Arc::new(InputState {
-            hotkey: AtomicU16::new(hotkey),
+            bindings: Mutex::new(Vec::new()),
             mode: AtomicU8::new(IDLE),
             in_area: AtomicBool::new(false),
             overflow: AtomicBool::new(false),
@@ -68,7 +77,7 @@ impl InputMonitor {
         let shared = state.clone();
         let thread = thread::Builder::new()
             .name("physical-input".into())
-            .spawn(move || monitor(&shared, &playback, tx))
+            .spawn(move || monitor(&shared, tx))
             .expect("Cannot create input monitor thread");
         Self {
             state,
@@ -135,7 +144,7 @@ fn discover(readers: &mut Vec<Reader>, state: &InputState) {
     };
 }
 
-fn monitor(state: &InputState, playback: &PlaybackState, tx: SyncSender<Message>) {
+fn monitor(state: &InputState, tx: SyncSender<Message>) {
     let mut readers = Vec::new();
     discover(&mut readers, state);
     let mut scan = Instant::now();
@@ -171,27 +180,43 @@ fn monitor(state: &InputState, playback: &PlaybackState, tx: SyncSender<Message>
         events.sort_by_key(|event| event.0);
         for &(at, code, pressed) in &events {
             let mode = state.mode.load(Ordering::Acquire);
-            let message = if mode == IDLE {
-                if !pressed || code != state.hotkey.load(Ordering::Relaxed) {
-                    continue;
+            if mode == IDLE {
+                let bindings = state.bindings.lock().unwrap_or_else(|e| e.into_inner());
+                for (binding, (hotkey, hold, playback)) in bindings.iter().enumerate() {
+                    if *hotkey != code || (!pressed && !hold) {
+                        continue;
+                    }
+                    let message = if *hold {
+                        // The release is still sent: the start may not have happened yet.
+                        Message::Hold { binding, pressed }
+                    } else {
+                        Message::Toggle {
+                            binding,
+                            stop_only: playback.running.load(Ordering::Acquire),
+                        }
+                    };
+                    if matches!(
+                        message,
+                        Message::Toggle { stop_only: true, .. } | Message::Hold { pressed: false, .. }
+                    ) {
+                        // Stop directly from this thread, even if rendering is overloaded.
+                        playback.cancel.stop();
+                    }
+                    if tx.try_send(message).is_err() {
+                        state.overflow.store(true, Ordering::Release);
+                    }
                 }
-                let stop_only = playback.running.load(Ordering::Acquire);
-                if stop_only {
-                    // Stop directly from this thread, even if rendering is overloaded.
-                    playback.cancel.stop();
-                }
-                Message::Toggle { stop_only }
             } else {
-                Message::Key {
+                let message = Message::Key {
                     code,
                     pressed,
                     at,
                     mode,
                     in_area: state.in_area.load(Ordering::Acquire),
+                };
+                if tx.try_send(message).is_err() {
+                    state.overflow.store(true, Ordering::Release);
                 }
-            };
-            if tx.try_send(message).is_err() {
-                state.overflow.store(true, Ordering::Release);
             }
         }
         thread::sleep(Duration::from_millis(1));

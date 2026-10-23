@@ -52,14 +52,65 @@ pub fn click_sequence() -> Vec<Step> {
     ]
 }
 
+/// Keys that may start and stop a macro: any keyboard key, or a mouse button
+/// other than left and right, which are needed to use the interface.
+pub fn is_hotkey(code: u16) -> bool {
+    is_keyboard(code)
+        || (KeyCode::BTN_MIDDLE.code()..=KeyCode::BTN_TASK.code()).contains(&code)
+}
+
+/// A global key and the macro it starts and stops.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Binding {
+    pub hotkey: u16,
+    /// Play only while the hotkey is held, instead of toggling on each press.
+    #[serde(default)]
+    pub hold: bool,
+    pub steps: Vec<Step>,
+}
+
+impl Default for Binding {
+    fn default() -> Self {
+        Self {
+            hotkey: KeyCode::KEY_F6.code(),
+            hold: false,
+            steps: click_sequence(),
+        }
+    }
+}
+
+/// A named set of bindings. Only the active profile's keys are listened for.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Profile {
+    pub name: String,
+    pub bindings: Vec<Binding>,
+}
+
+impl Profile {
+    pub fn new(name: String) -> Self {
+        Self {
+            name,
+            bindings: vec![Binding::default()],
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub loop_delay_ms: u64,
     pub parallel: bool,
     pub devices: usize,
-    pub hotkey: u16,
-    pub steps: Vec<Step>,
+    pub profiles: Vec<Profile>,
+    /// The active profile.
+    pub profile: usize,
+    /// The binding of the active profile shown on the Sequence page.
+    pub binding: usize,
+    // Single-macro settings from before profiles, moved into a profile on load.
+    #[serde(skip_serializing)]
+    pub hotkey: Option<u16>,
+    #[serde(skip_serializing)]
+    pub steps: Option<Vec<Step>>,
 }
 
 impl Default for Settings {
@@ -68,8 +119,11 @@ impl Default for Settings {
             loop_delay_ms: 20,
             parallel: false,
             devices: 5,
-            hotkey: KeyCode::KEY_F6.code(),
-            steps: click_sequence(),
+            profiles: vec![Profile::new("Default".into())],
+            profile: 0,
+            binding: 0,
+            hotkey: None,
+            steps: None,
         }
     }
 }
@@ -78,9 +132,53 @@ impl Settings {
     pub fn sanitize(&mut self) {
         self.loop_delay_ms = self.loop_delay_ms.min(2000);
         self.devices = self.devices.clamp(1, 50);
-        if !is_keyboard(self.hotkey) {
-            self.hotkey = KeyCode::KEY_F6.code();
+        // Files from before profiles have no profiles, so they load the default one.
+        if self.hotkey.is_some() || self.steps.is_some() {
+            let mut binding = Binding::default();
+            if let Some(hotkey) = self.hotkey.take() {
+                binding.hotkey = hotkey;
+            }
+            if let Some(steps) = self.steps.take() {
+                binding.steps = steps;
+            }
+            self.profiles = vec![Profile {
+                name: "Default".into(),
+                bindings: vec![binding],
+            }];
         }
+        if self.profiles.is_empty() {
+            self.profiles.push(Profile::new("Default".into()));
+        }
+        for profile in &mut self.profiles {
+            if profile.bindings.is_empty() {
+                profile.bindings.push(Binding::default());
+            }
+            for binding in &mut profile.bindings {
+                if !is_hotkey(binding.hotkey) {
+                    binding.hotkey = KeyCode::KEY_F6.code();
+                }
+            }
+        }
+        self.profile = self.profile.min(self.profiles.len() - 1);
+        self.binding = self.binding.min(self.active().bindings.len() - 1);
+    }
+
+    pub fn active(&self) -> &Profile {
+        &self.profiles[self.profile]
+    }
+
+    pub fn active_mut(&mut self) -> &mut Profile {
+        &mut self.profiles[self.profile]
+    }
+
+    /// The binding being edited.
+    pub fn current(&self) -> &Binding {
+        &self.active().bindings[self.binding]
+    }
+
+    pub fn current_mut(&mut self) -> &mut Binding {
+        let index = self.binding;
+        &mut self.active_mut().bindings[index]
     }
 
     /// `$XDG_CONFIG_HOME/rust-clicker/settings.json`.
@@ -256,6 +354,19 @@ mod tests {
             vec![Step::Press(18), Step::Delay(25_000), Step::Release(18)]
         );
         assert!(validate(&steps).is_ok());
+    }
+
+    #[test]
+    fn single_macro_settings_become_a_profile() {
+        let mut settings: Settings = serde_json::from_str(
+            r#"{"loop_delay_ms":5,"hotkey":30,"steps":[{"Press":18},{"Release":18}]}"#,
+        )
+        .unwrap();
+        settings.sanitize();
+        assert_eq!(settings.profiles.len(), 1);
+        assert_eq!(settings.current().hotkey, 30);
+        assert_eq!(settings.current().steps, vec![Step::Press(18), Step::Release(18)]);
+        assert!(is_hotkey(KeyCode::BTN_SIDE.code()) && !is_hotkey(KeyCode::BTN_LEFT.code()));
     }
 
     #[test]
