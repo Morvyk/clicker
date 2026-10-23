@@ -1,13 +1,12 @@
 use std::{
     collections::BTreeSet,
     io,
-    os::fd::AsFd,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use evdev::{
@@ -17,6 +16,10 @@ use evdev::{
 use crate::model::{Settings, Step, validate};
 
 pub const DEVICE_PREFIX: &str = "RustClicker virtual";
+
+/// How long udev and the compositor need to discover a new virtual device
+/// before its input is delivered.
+const SETTLE: Duration = Duration::from_millis(500);
 
 #[derive(Default)]
 pub struct Cancellation {
@@ -55,6 +58,25 @@ impl Cancellation {
     }
 }
 
+/// A validated macro and how to play it.
+#[derive(Clone, PartialEq)]
+struct Job {
+    steps: Arc<[Step]>,
+    delay: Duration,
+    devices: usize,
+}
+
+/// Requests from the app and the hotkey thread to the rig thread.
+#[derive(Default)]
+struct Control {
+    /// The macro a trigger plays; None while the macro is invalid.
+    job: Option<Job>,
+    /// The job changed, so its devices may need to be rebuilt.
+    changed: bool,
+    start: bool,
+    quit: bool,
+}
+
 #[derive(Default)]
 pub struct PlaybackState {
     pub cancel: Cancellation,
@@ -66,6 +88,8 @@ pub struct PlaybackState {
     pub test_clicks: AtomicU64,
     pub test_overruns: AtomicU64,
     error: Mutex<Option<String>>,
+    control: Mutex<Control>,
+    wake: Condvar,
 }
 
 impl PlaybackState {
@@ -76,12 +100,32 @@ impl PlaybackState {
         }
         self.cancel.stop();
     }
+
+    /// Starts the prepared macro from any thread, without waiting for the
+    /// interface. Returns false when nothing was started: no valid macro is
+    /// prepared, or it is already running.
+    pub fn trigger(&self) -> bool {
+        let mut control = self.control.lock().unwrap_or_else(|e| e.into_inner());
+        if control.job.is_none() || control.quit || self.running.load(Ordering::Acquire) {
+            return false;
+        }
+        self.cancel.reset();
+        self.loops.store(0, Ordering::Relaxed);
+        self.ready.store(false, Ordering::Release);
+        *self.error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.running.store(true, Ordering::Release);
+        control.start = true;
+        self.wake.notify_all();
+        true
+    }
 }
 
+/// Plays one macro. Its virtual devices are created ahead of time and kept
+/// between runs, so a start does not wait for new devices to be discovered.
 #[derive(Default)]
 pub struct Engine {
     pub state: Arc<PlaybackState>,
-    coordinator: Option<JoinHandle<()>>,
+    rig: Option<JoinHandle<()>>,
 }
 
 impl Engine {
@@ -89,52 +133,48 @@ impl Engine {
         self.state.running.load(Ordering::Acquire)
     }
 
+    /// Prepares the macro that `start` and `PlaybackState::trigger` play, and
+    /// creates its devices in the background if they do not fit it yet.
+    pub fn prepare(&mut self, settings: &Settings, steps: &[Step]) -> Result<(), String> {
+        let valid = validate(steps);
+        let mut control = self.state.control.lock().unwrap_or_else(|e| e.into_inner());
+        let delay = Duration::from_millis(settings.loop_delay_ms);
+        let devices = settings.device_count();
+        let unchanged = control.job.as_ref().is_some_and(|job| {
+            job.delay == delay && job.devices == devices && *job.steps == *steps
+        });
+        if valid.is_err() {
+            control.job = None;
+        } else if !unchanged {
+            control.job = Some(Job {
+                steps: steps.into(),
+                delay,
+                devices,
+            });
+            control.changed = true;
+            self.state.wake.notify_all();
+        }
+        drop(control);
+        valid?;
+        if self.rig.is_none() {
+            let state = self.state.clone();
+            let rig = thread::Builder::new()
+                .name("playback".into())
+                .spawn(move || rig(&state))
+                .map_err(|error| format!("Cannot start playback thread: {error}"))?;
+            self.rig = Some(rig);
+        }
+        Ok(())
+    }
+
     pub fn start(&mut self, settings: &Settings, steps: &[Step]) -> Result<(), String> {
-        self.reap();
-        if self.coordinator.is_some() {
-            return Err("Playback is still stopping. Try again in a moment.".into());
-        }
-        validate(steps)?;
-        self.state.cancel.reset();
-        self.state.loops.store(0, Ordering::Relaxed);
-        self.state.ready.store(false, Ordering::Release);
-        *self.state.error.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        self.state.running.store(true, Ordering::Release);
-        let state = self.state.clone();
-        let settings = settings.clone();
-        let steps: Arc<[Step]> = steps.into();
-        match thread::Builder::new()
-            .name("playback".into())
-            .spawn(move || {
-                run_devices(&settings, steps, &state);
-                state.ready.store(false, Ordering::Release);
-                state.running.store(false, Ordering::Release);
-            }) {
-            Ok(handle) => self.coordinator = Some(handle),
-            Err(error) => {
-                self.state.running.store(false, Ordering::Release);
-                return Err(format!("Cannot start playback thread: {error}"));
-            }
-        }
+        self.prepare(settings, steps)?;
+        self.state.trigger();
         Ok(())
     }
 
     pub fn stop(&self) {
         self.state.cancel.stop();
-    }
-
-    pub fn reap(&mut self) {
-        if self
-            .coordinator
-            .as_ref()
-            .is_some_and(JoinHandle::is_finished)
-            && let Some(handle) = self.coordinator.take()
-            && handle.join().is_err()
-        {
-            self.state
-                .fail("Playback thread unexpectedly exited.".into());
-            self.state.running.store(false, Ordering::Release);
-        }
     }
 
     pub fn take_error(&self) -> Option<String> {
@@ -148,8 +188,14 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        self.state
+            .control
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .quit = true;
+        self.state.wake.notify_all();
         self.stop();
-        if let Some(handle) = self.coordinator.take() {
+        if let Some(handle) = self.rig.take() {
             let _ = handle.join();
         }
     }
@@ -180,93 +226,156 @@ fn make_device(index: usize, steps: &[Step]) -> io::Result<VirtualDevice> {
         .build()
 }
 
-fn run_devices(settings: &Settings, steps: Arc<[Step]>, state: &Arc<PlaybackState>) {
-    let mut devices = Vec::new();
-    let mut probes = Vec::new();
-    for index in 0..settings.device_count() {
-        if state.cancel.is_stopped() {
-            return;
-        }
-        match make_device(index, &steps) {
-            Ok(mut device) => match crate::tester::Probe::open(&mut device) {
-                Ok(probe) => {
-                    probes.push(Arc::new(Mutex::new(probe)));
-                    devices.push(device);
-                }
-                Err(error) => {
-                    state.fail(format!("Cannot open the device's input stream: {error}"));
-                    return;
-                }
-            },
-            Err(error) => {
-                state.fail(format!(
+/// Input codes a device needs beyond the standard keyboard and mouse set.
+fn extra_keys(steps: &[Step]) -> BTreeSet<u16> {
+    steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::Press(code) | Step::Release(code) => Some(*code),
+            Step::Delay(_) => None,
+        })
+        .filter(|code| {
+            !(1..=248).contains(code)
+                && !(KeyCode::BTN_LEFT.code()..=KeyCode::BTN_TASK.code()).contains(code)
+        })
+        .collect()
+}
+
+fn is_mouse(steps: &[Step]) -> bool {
+    steps.iter().any(|step| {
+        matches!(step, Step::Press(code)
+            if (KeyCode::BTN_LEFT.code()..=KeyCode::BTN_TASK.code()).contains(code))
+    })
+}
+
+/// Virtual devices that stay open between runs.
+struct Devices {
+    // Declared first so it is dropped, and drains the final events, first.
+    _tester: crate::tester::Tester,
+    devices: Vec<RoutedDevice>,
+    keys: BTreeSet<u16>,
+    created: Instant,
+}
+
+impl Devices {
+    fn create(job: &Job, state: &Arc<PlaybackState>) -> Result<Self, String> {
+        let mut devices = Vec::new();
+        let mut probes = Vec::new();
+        for index in 0..job.devices {
+            let mut device = make_device(index, &job.steps).map_err(|error| {
+                format!(
                     "Cannot create virtual input device: {error}. Check /dev/uinput access (see README.md)."
-                ));
+                )
+            })?;
+            let probe = crate::tester::Probe::open(&mut device)
+                .map_err(|error| format!("Cannot open the device's input stream: {error}"))?;
+            let probe = Arc::new(Mutex::new(probe));
+            probes.push(probe.clone());
+            devices.push(RoutedDevice {
+                device,
+                probe,
+                captured: false,
+                measuring: false,
+                has_mouse: false,
+                state: state.clone(),
+            });
+        }
+        let tester = crate::tester::Tester::start(probes, state.clone())
+            .map_err(|error| format!("Cannot start the CPS reader: {error}"))?;
+        Ok(Self {
+            _tester: tester,
+            devices,
+            keys: extra_keys(&job.steps),
+            created: Instant::now(),
+        })
+    }
+
+    fn fit(&self, job: &Job) -> bool {
+        self.devices.len() == job.devices && extra_keys(&job.steps).is_subset(&self.keys)
+    }
+
+    /// Plays the job on every device until stopped. Returns false if a device failed.
+    fn play(&mut self, job: &Job, state: &PlaybackState) -> bool {
+        let settle = SETTLE.saturating_sub(self.created.elapsed());
+        if !settle.is_zero() && state.cancel.wait(settle) {
+            return true;
+        }
+        state.ready.store(true, Ordering::Release);
+        let has_mouse = is_mouse(&job.steps);
+        thread::scope(|scope| {
+            let workers: Vec<_> = self
+                .devices
+                .iter_mut()
+                .enumerate()
+                .map(|(index, device)| {
+                    device.has_mouse = has_mouse;
+                    thread::Builder::new()
+                        .name(format!("device-{}", index + 1))
+                        .spawn_scoped(scope, move || {
+                            play_loop(device, &job.steps, job.delay, state).map_err(|error| {
+                                state.fail(format!("Device {}: {error}", index + 1));
+                            })
+                        })
+                })
+                .collect();
+            let mut ok = true;
+            for worker in workers {
+                ok &= match worker {
+                    Ok(worker) => worker.join().unwrap_or_else(|_| {
+                        state.fail("A device worker unexpectedly exited.".into());
+                        Err(())
+                    }),
+                    Err(error) => {
+                        state.fail(format!("Cannot start device worker: {error}"));
+                        Err(())
+                    }
+                }
+                .is_ok();
+            }
+            ok
+        })
+    }
+}
+
+/// Keeps devices that fit the prepared job, and plays it when triggered.
+fn rig(state: &Arc<PlaybackState>) {
+    let mut devices: Option<Devices> = None;
+    loop {
+        let (job, start) = {
+            let control = state.control.lock().unwrap_or_else(|e| e.into_inner());
+            let mut control = state
+                .wake
+                .wait_while(control, |c| !c.quit && !c.start && !c.changed)
+                .unwrap_or_else(|e| e.into_inner());
+            if control.quit {
                 return;
             }
-        }
-    }
-    let tester = match crate::tester::Tester::start(probes.clone(), state.clone()) {
-        Ok(tester) => tester,
-        Err(error) => {
-            state.fail(format!("Cannot start the CPS reader: {error}"));
-            return;
-        }
-    };
-    // Keep the uinput file descriptions alive until the reader has drained the
-    // final events after worker shutdown. This adds no work to the emission path.
-    let _keepalive = match devices
-        .iter()
-        .map(|device| device.as_fd().try_clone_to_owned())
-        .collect::<io::Result<Vec<_>>>()
-    {
-        Ok(fds) => fds,
-        Err(error) => {
-            state.fail(format!("Cannot retain virtual device handles: {error}"));
-            return;
-        }
-    };
-    // Allow udev and the compositor to discover all newly-created devices.
-    if state.cancel.wait(Duration::from_millis(500)) {
-        return;
-    }
-    state.ready.store(true, Ordering::Release);
-    let mut workers = Vec::new();
-    for (index, (device, probe)) in devices.into_iter().zip(probes).enumerate() {
-        let steps = steps.clone();
-        let shared = state.clone();
-        let delay = Duration::from_millis(settings.loop_delay_ms);
-        match thread::Builder::new()
-            .name(format!("device-{}", index + 1))
-            .spawn(move || {
-                let sink = RoutedDevice {
-                    device,
-                    probe,
-                    captured: false,
-                    measuring: false,
-                    has_mouse: steps.iter().any(|step| {
-                        matches!(step, Step::Press(code)
-                        if (KeyCode::BTN_LEFT.code()..=KeyCode::BTN_TASK.code()).contains(code))
-                    }),
-                    state: shared.clone(),
-                };
-                if let Err(error) = play_loop(sink, &steps, delay, &shared) {
-                    shared.fail(format!("Device {}: {error}", index + 1));
-                }
-            }) {
-            Ok(worker) => workers.push(worker),
-            Err(error) => {
-                state.fail(format!("Cannot start device worker: {error}"));
-                break;
+            control.changed = false;
+            (control.job.clone(), std::mem::take(&mut control.start))
+        };
+        if let Some(job) = &job
+            && !devices.as_ref().is_some_and(|devices| devices.fit(job))
+        {
+            // Remove the old devices before creating their replacements.
+            devices = None;
+            match Devices::create(job, state) {
+                Ok(created) => devices = Some(created),
+                // Only report errors for a start, not while preparing ahead.
+                Err(error) if start => state.fail(error),
+                Err(_) => {}
             }
         }
-    }
-    for worker in workers {
-        if worker.join().is_err() {
-            state.fail("A device worker unexpectedly exited.".into());
+        if start {
+            if let (Some(job), Some(rig)) = (&job, &mut devices)
+                && !rig.play(job, state)
+            {
+                // Recreate devices that failed before the next run.
+                devices = None;
+            }
+            state.ready.store(false, Ordering::Release);
+            state.running.store(false, Ordering::Release);
         }
     }
-    drop(tester);
 }
 
 trait InputSink {
@@ -311,12 +420,12 @@ impl InputSink for VirtualDevice {
     }
 }
 
-struct HeldKeys<S: InputSink> {
-    sink: S,
+struct HeldKeys<'a, S: InputSink> {
+    sink: &'a mut S,
     held: BTreeSet<u16>,
 }
 
-impl<S: InputSink> HeldKeys<S> {
+impl<S: InputSink> HeldKeys<'_, S> {
     fn send(&mut self, code: u16, pressed: bool) -> io::Result<()> {
         // Track before sending: a partially successful write must also be cleaned up.
         if pressed {
@@ -330,7 +439,7 @@ impl<S: InputSink> HeldKeys<S> {
     }
 }
 
-impl<S: InputSink> Drop for HeldKeys<S> {
+impl<S: InputSink> Drop for HeldKeys<'_, S> {
     fn drop(&mut self) {
         for code in &self.held {
             let _ = self.sink.key(*code, false);
@@ -339,7 +448,7 @@ impl<S: InputSink> Drop for HeldKeys<S> {
 }
 
 fn play_loop(
-    sink: impl InputSink,
+    sink: &mut impl InputSink,
     steps: &[Step],
     delay: Duration,
     state: &PlaybackState,
@@ -380,6 +489,7 @@ fn play_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsFd;
     use std::sync::mpsc;
     use std::time::Instant;
 
@@ -398,7 +508,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let worker = thread::spawn(move || {
             play_loop(
-                MockSink(tx),
+                &mut MockSink(tx),
                 &[Step::Press(18), Step::Delay(60_000_000), Step::Release(18)],
                 Duration::ZERO,
                 &shared,
@@ -423,7 +533,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let worker = thread::spawn(move || {
             play_loop(
-                MockSink(tx),
+                &mut MockSink(tx),
                 &[
                     Step::Press(29),
                     Step::Press(18),
@@ -527,7 +637,7 @@ mod tests {
         let state = Arc::new(PlaybackState::default());
         state.testing.store(true, Ordering::Relaxed);
         let tester = crate::tester::Tester::start(vec![probe.clone()], state.clone()).unwrap();
-        let sink = RoutedDevice {
+        let mut sink = RoutedDevice {
             device,
             probe,
             captured: false,
@@ -536,7 +646,7 @@ mod tests {
             state: state.clone(),
         };
         let shared = state.clone();
-        let worker = thread::spawn(move || play_loop(sink, &steps, Duration::ZERO, &shared));
+        let worker = thread::spawn(move || play_loop(&mut sink, &steps, Duration::ZERO, &shared));
         thread::sleep(Duration::from_secs(2));
         state.cancel.stop();
         worker.join().unwrap().unwrap();
@@ -562,6 +672,39 @@ mod tests {
             Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
         }
         drop(keepalive);
+    }
+
+    #[test]
+    #[ignore = "requires /dev/uinput and /dev/input access"]
+    fn prepared_devices_start_without_waiting() {
+        let mut engine = Engine::default();
+        // Capture into the tester so no click reaches the desktop.
+        engine.state.testing.store(true, Ordering::Relaxed);
+        let settings = Settings::default();
+        let steps = crate::model::click_sequence();
+        let first_click = |engine: &Engine| {
+            let started = Instant::now();
+            assert!(engine.state.trigger());
+            while engine.state.test_clicks.load(Ordering::Relaxed) == 0 {
+                assert!(started.elapsed() < Duration::from_secs(5), "{:?}", engine.take_error());
+                thread::sleep(Duration::from_micros(200));
+            }
+            engine.stop();
+            while engine.running() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            engine.state.test_clicks.store(0, Ordering::Relaxed);
+            started.elapsed()
+        };
+        // The first start also creates the devices, as every start used to.
+        engine.prepare(&settings, &steps).unwrap();
+        let cold = first_click(&engine);
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            times.push(first_click(&engine));
+        }
+        eprintln!("trigger to first click: new devices {cold:?}, prepared devices {times:?}");
+        assert!(times.iter().all(|time| *time < Duration::from_millis(50)));
     }
 
     #[test]

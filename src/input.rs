@@ -28,16 +28,10 @@ pub enum Message {
         mode: u8,
         in_area: bool,
     },
-    /// A binding's hotkey was pressed.
-    Toggle {
-        binding: BindingId,
-        stop_only: bool,
-    },
-    /// The hotkey of a hold-to-play binding was pressed or released.
-    Hold {
-        binding: BindingId,
-        pressed: bool,
-    },
+    /// A binding's hotkey started or stopped its macro. `handled` is false
+    /// when the macro could not be started here, so the app should start it
+    /// and report why it fails.
+    Hotkey { binding: BindingId, handled: bool },
 }
 
 #[derive(Clone, Default)]
@@ -197,23 +191,20 @@ fn monitor(state: &InputState, tx: SyncSender<Message>) {
                     if hotkey != code || (!pressed && !hold) {
                         continue;
                     }
-                    let message = if hold {
-                        // The release is still sent: the start may not have happened yet.
-                        Message::Hold { binding, pressed }
+                    // Start and stop directly from this thread, so neither waits
+                    // for the interface, even if rendering is overloaded.
+                    let stop = if hold {
+                        !pressed
                     } else {
-                        Message::Toggle {
-                            binding,
-                            stop_only: playback.running.load(Ordering::Acquire),
-                        }
+                        playback.running.load(Ordering::Acquire)
                     };
-                    if matches!(
-                        message,
-                        Message::Toggle { stop_only: true, .. } | Message::Hold { pressed: false, .. }
-                    ) {
-                        // Stop directly from this thread, even if rendering is overloaded.
+                    let handled = if stop {
                         playback.cancel.stop();
-                    }
-                    if tx.try_send(message).is_err() {
+                        true
+                    } else {
+                        playback.trigger() || playback.running.load(Ordering::Acquire)
+                    };
+                    if tx.try_send(Message::Hotkey { binding, handled }).is_err() {
                         state.overflow.store(true, Ordering::Release);
                     }
                 }

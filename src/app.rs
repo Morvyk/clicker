@@ -301,6 +301,23 @@ impl ClickerApp {
             .bindings
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = listened;
+        self.prepare_all();
+    }
+
+    /// Gives every enabled key's engine its current macro, so its devices are
+    /// ready before the key is pressed. Invalid macros are reported on start.
+    fn prepare_all(&mut self) {
+        if cfg!(test) {
+            return;
+        }
+        for (profile, engines) in self.settings.profiles.iter().zip(&mut self.engines) {
+            if !profile.enabled {
+                continue;
+            }
+            for (binding, engine) in profile.bindings.iter().zip(engines) {
+                let _ = engine.prepare(&self.settings, &binding.steps);
+            }
+        }
     }
 
     fn all_engines(&self) -> impl Iterator<Item = &Engine> {
@@ -550,7 +567,6 @@ impl ClickerApp {
                 .gui_hovered
                 .store(self.cursor_in_window, Ordering::Relaxed);
             engine.state.testing.store(testing, Ordering::Relaxed);
-            engine.reap();
             if let Some(error) = engine.take_error() {
                 self.error = Some(error);
             }
@@ -567,20 +583,13 @@ impl ClickerApp {
         );
         while let Ok(message) = self.input.messages.try_recv() {
             match message {
-                input::Message::Toggle { binding, stop_only } => {
-                    if stop_only {
-                        if let Some(engine) = self.engine(binding) {
-                            engine.stop();
-                        }
+                input::Message::Hotkey { binding, handled } => {
+                    if handled {
+                        self.editing = None;
                     } else {
-                        self.toggle(binding);
+                        self.start(binding);
                     }
                 }
-                input::Message::Hold { binding, pressed } => match self.engine(binding) {
-                    Some(engine) if !pressed => engine.stop(),
-                    Some(engine) if !engine.running() => self.start(binding),
-                    _ => {}
-                },
                 input::Message::Key {
                     code,
                     pressed,
@@ -644,6 +653,9 @@ impl ClickerApp {
         let now = Instant::now();
         self.cps.prune(now);
         self.lps.prune(now);
+        if self.dirty && !self.recording {
+            self.prepare_all();
+        }
         if self.dirty && self.last_save.elapsed() >= Duration::from_secs(1) {
             self.save();
         }
