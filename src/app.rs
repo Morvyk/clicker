@@ -17,7 +17,7 @@ use iced::{
 use crate::{
     engine::Engine,
     icons::Icons,
-    input::{self, InputMonitor},
+    input::{self, BindingId, InputMonitor, Listened},
     model::{self, Binding, Profile, Recorder, Settings, Step, format_ms, key_name},
     theme::{Appearance, Look, system_appearance},
 };
@@ -96,6 +96,7 @@ pub enum Message {
     AddBinding,
     RemoveBinding(usize),
     SetHold(usize, bool),
+    SetProfileEnabled(bool),
     EditBinding(usize),
     // Sequence.
     Record,
@@ -167,9 +168,9 @@ impl CpsMeter {
 
 pub struct ClickerApp {
     settings: Settings,
-    /// One engine per binding of the active profile, so each key's macro runs
-    /// on its own.
-    engines: Vec<Engine>,
+    /// One engine per binding of every profile, by profile and binding index,
+    /// so each key's macro runs on its own.
+    engines: Vec<Vec<Engine>>,
     input: InputMonitor,
     page: Page,
     recording: bool,
@@ -273,57 +274,85 @@ impl ClickerApp {
         app
     }
 
-    /// Matches the engines and the listened-for hotkeys to the active profile.
-    /// Bindings only change while idle, so no dropped engine is still running.
+    /// Matches the engines to the profiles, and listens for the hotkeys of
+    /// every enabled profile. Bindings are only added or removed while idle,
+    /// so no dropped engine is still running.
     fn sync_bindings(&mut self) {
-        let bindings = &self.settings.active().bindings;
-        self.engines.resize_with(bindings.len(), Engine::default);
+        let profiles = &self.settings.profiles;
+        self.engines.resize_with(profiles.len(), Vec::new);
+        let mut listened = Vec::new();
+        for (p, (profile, engines)) in profiles.iter().zip(&mut self.engines).enumerate() {
+            engines.resize_with(profile.bindings.len(), Engine::default);
+            if !profile.enabled {
+                continue;
+            }
+            for (b, (binding, engine)) in profile.bindings.iter().zip(engines.iter()).enumerate() {
+                listened.push(Listened {
+                    id: (p, b),
+                    hotkey: binding.hotkey,
+                    hold: binding.hold,
+                    playback: engine.state.clone(),
+                });
+            }
+        }
         *self
             .input
             .state
             .bindings
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = bindings
-            .iter()
-            .zip(&self.engines)
-            .map(|(binding, engine)| (binding.hotkey, binding.hold, engine.state.clone()))
-            .collect();
+            .unwrap_or_else(|e| e.into_inner()) = listened;
+    }
+
+    fn all_engines(&self) -> impl Iterator<Item = &Engine> {
+        self.engines.iter().flatten()
+    }
+
+    fn engine(&self, (profile, binding): BindingId) -> Option<&Engine> {
+        self.engines.get(profile)?.get(binding)
+    }
+
+    /// The binding at this index of the shown profile.
+    fn shown(&self, binding: usize) -> BindingId {
+        (self.settings.profile, binding)
     }
 
     fn running(&self) -> bool {
-        self.engines.iter().any(Engine::running)
+        self.all_engines().any(Engine::running)
     }
 
     fn stop_all(&self) {
-        for engine in &self.engines {
+        for engine in self.all_engines() {
             engine.stop();
         }
     }
 
     fn loops(&self) -> u64 {
-        self.engines
-            .iter()
+        self.all_engines()
             .map(|engine| engine.state.loops.load(Ordering::Relaxed))
             .sum()
     }
 
     fn test_clicks(&self) -> u64 {
-        self.engines
-            .iter()
+        self.all_engines()
             .map(|engine| engine.state.test_clicks.load(Ordering::Relaxed))
             .sum()
     }
 
     fn test_overruns(&self) -> u64 {
-        self.engines
-            .iter()
+        self.all_engines()
             .map(|engine| engine.state.test_overruns.load(Ordering::Relaxed))
             .sum()
     }
 
-    /// The first of F6–F12 that no binding of the active profile uses yet.
+    /// The first of F6–F12 that no binding of any profile uses yet.
     fn free_hotkey(&self) -> u16 {
-        let used = |code: u16| self.settings.active().bindings.iter().any(|b| b.hotkey == code);
+        let used = |code: u16| {
+            self.settings
+                .profiles
+                .iter()
+                .flat_map(|profile| &profile.bindings)
+                .any(|b| b.hotkey == code)
+        };
         [
             KeyCode::KEY_F6,
             KeyCode::KEY_F7,
@@ -420,21 +449,24 @@ impl ClickerApp {
         )
     }
 
-    fn start(&mut self, binding: usize) {
+    fn start(&mut self, (profile, binding): BindingId) {
         if self.recording || self.selecting_hotkey.is_some() {
             return;
         }
         self.editing = None;
         if let (Some(engine), Some(macro_)) = (
-            self.engines.get_mut(binding),
-            self.settings.active().bindings.get(binding),
+            self.engines.get_mut(profile).and_then(|engines| engines.get_mut(binding)),
+            self.settings
+                .profiles
+                .get(profile)
+                .and_then(|profile| profile.bindings.get(binding)),
         ) {
             self.error = engine.start(&self.settings, &macro_.steps).err();
         }
     }
 
-    fn toggle(&mut self, binding: usize) {
-        match self.engines.get(binding) {
+    fn toggle(&mut self, binding: BindingId) {
+        match self.engine(binding) {
             Some(engine) if engine.running() => engine.stop(),
             Some(_) => self.start(binding),
             None => {}
@@ -512,7 +544,7 @@ impl ClickerApp {
 
     fn receive_input(&mut self) {
         let testing = self.in_pad && self.page == Page::Test;
-        for engine in &mut self.engines {
+        for engine in self.engines.iter_mut().flatten() {
             engine
                 .state
                 .gui_hovered
@@ -537,14 +569,14 @@ impl ClickerApp {
             match message {
                 input::Message::Toggle { binding, stop_only } => {
                     if stop_only {
-                        if let Some(engine) = self.engines.get(binding) {
+                        if let Some(engine) = self.engine(binding) {
                             engine.stop();
                         }
                     } else {
                         self.toggle(binding);
                     }
                 }
-                input::Message::Hold { binding, pressed } => match self.engines.get(binding) {
+                input::Message::Hold { binding, pressed } => match self.engine(binding) {
                     Some(engine) if !pressed => engine.stop(),
                     Some(engine) if !engine.running() => self.start(binding),
                     _ => {}
@@ -718,9 +750,9 @@ impl ClickerApp {
                 }
             }
             Message::Escape | Message::Enter => self.end_edit(),
-            Message::Start => self.start(self.settings.binding),
+            Message::Start => self.start(self.shown(self.settings.binding)),
             Message::Stop => self.stop_all(),
-            Message::ToggleBinding(index) => self.toggle(index),
+            Message::ToggleBinding(index) => self.toggle(self.shown(index)),
             Message::SetParallel(parallel) => {
                 self.settings.parallel = parallel;
                 self.dirty = true;
@@ -758,16 +790,31 @@ impl ClickerApp {
                 self.sync_input_mode();
             }
             Message::SelectProfile(index) => {
-                if self.idle() && index < self.settings.profiles.len() {
+                if !self.recording
+                    && self.selecting_hotkey.is_none()
+                    && index < self.settings.profiles.len()
+                {
                     self.settings.profile = index;
                     self.show_binding(0);
-                    self.sync_bindings();
                 }
+            }
+            Message::SetProfileEnabled(enabled) => {
+                self.settings.active_mut().enabled = enabled;
+                if !enabled {
+                    for engine in &self.engines[self.settings.profile] {
+                        engine.stop();
+                    }
+                }
+                self.sync_bindings();
+                self.dirty = true;
             }
             Message::AddProfile => {
                 if self.idle() {
                     let name = format!("Profile {}", self.settings.profiles.len() + 1);
-                    self.settings.profiles.push(Profile::new(name));
+                    let mut profile = Profile::new(name);
+                    // Every profile is listened for, so start on a key no other uses.
+                    profile.bindings[0].hotkey = self.free_hotkey();
+                    self.settings.profiles.push(profile);
                     self.settings.profile = self.settings.profiles.len() - 1;
                     self.show_binding(0);
                     self.sync_bindings();
@@ -931,7 +978,7 @@ impl ClickerApp {
             Message::ResetCps => {
                 self.cps = CpsMeter::default();
                 self.cps_observed = self.test_clicks();
-                for engine in &self.engines {
+                for engine in self.all_engines() {
                     engine.state.test_overruns.store(0, Ordering::Relaxed);
                 }
             }
@@ -1004,14 +1051,14 @@ mod tests {
         let mut app = ClickerApp::from_settings(Settings::default());
         let _ = app.update(Message::PadEntered);
         let _ = app.update(Message::Tick);
-        assert!(!app.engines[0].state.testing.load(Ordering::Relaxed));
+        assert!(!app.engines[0][0].state.testing.load(Ordering::Relaxed));
         let _ = app.update(Message::Navigate(Page::Test));
         let _ = app.update(Message::PadEntered);
         let _ = app.update(Message::Tick);
-        assert!(app.engines[0].state.testing.load(Ordering::Relaxed));
+        assert!(app.engines[0][0].state.testing.load(Ordering::Relaxed));
         let _ = app.update(Message::Navigate(Page::Sequence));
         let _ = app.update(Message::Tick);
-        assert!(!app.engines[0].state.testing.load(Ordering::Relaxed));
+        assert!(!app.engines[0][0].state.testing.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -1037,7 +1084,7 @@ mod tests {
     fn bindings_get_their_own_engine_and_profiles_switch_them() {
         let mut app = ClickerApp::from_settings(Settings::default());
         let _ = app.update(Message::AddBinding);
-        assert_eq!(app.engines.len(), 2);
+        assert_eq!(app.engines[0].len(), 2);
         let hotkeys: Vec<u16> = app.settings.active().bindings.iter().map(|b| b.hotkey).collect();
         assert_eq!(hotkeys, [KeyCode::KEY_F6.code(), KeyCode::KEY_F7.code()]);
         assert_eq!(app.input.state.bindings.lock().unwrap().len(), 2);
@@ -1046,12 +1093,19 @@ mod tests {
         assert!(app.settings.current().steps.is_empty());
         assert!(!app.settings.active().bindings[0].steps.is_empty());
         let _ = app.update(Message::AddProfile);
-        assert_eq!((app.settings.profile, app.engines.len()), (1, 1));
+        assert_eq!((app.settings.profile, app.engines[1].len()), (1, 1));
+        assert_eq!(app.settings.current().hotkey, KeyCode::KEY_F8.code());
+        let listened = |app: &ClickerApp| -> Vec<BindingId> {
+            app.input.state.bindings.lock().unwrap().iter().map(|l| l.id).collect()
+        };
+        assert_eq!(listened(&app), [(0, 0), (0, 1), (1, 0)], "every profile is listened for");
+        let _ = app.update(Message::SetProfileEnabled(false));
+        assert_eq!(listened(&app), [(0, 0), (0, 1)]);
         let _ = app.update(Message::SelectProfile(0));
-        assert_eq!(app.engines.len(), 2);
         let _ = app.update(Message::RemoveBinding(0));
-        assert_eq!((app.engines.len(), app.settings.binding), (1, 0));
+        assert_eq!((app.engines[0].len(), app.settings.binding), (1, 0));
         assert!(app.settings.current().steps.is_empty());
+        assert_eq!(listened(&app), [(0, 0)]);
     }
 
     #[test]

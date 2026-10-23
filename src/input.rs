@@ -28,14 +28,14 @@ pub enum Message {
         mode: u8,
         in_area: bool,
     },
-    /// A hotkey of the binding at this index was pressed.
+    /// A binding's hotkey was pressed.
     Toggle {
-        binding: usize,
+        binding: BindingId,
         stop_only: bool,
     },
     /// The hotkey of a hold-to-play binding was pressed or released.
     Hold {
-        binding: usize,
+        binding: BindingId,
         pressed: bool,
     },
 }
@@ -46,10 +46,20 @@ pub struct DeviceStatus {
     pub denied: usize,
 }
 
+/// A binding's profile index and its index within that profile.
+pub type BindingId = (usize, usize);
+
+/// A binding that is listened for: its hotkey, whether it plays only while
+/// held, and the playback it controls.
+pub struct Listened {
+    pub id: BindingId,
+    pub hotkey: u16,
+    pub hold: bool,
+    pub playback: Arc<PlaybackState>,
+}
+
 pub struct InputState {
-    /// Each binding's hotkey, whether it plays only while held, and the
-    /// playback it controls, by binding index.
-    pub bindings: Mutex<Vec<(u16, bool, Arc<PlaybackState>)>>,
+    pub bindings: Mutex<Vec<Listened>>,
     pub mode: AtomicU8,
     pub in_area: AtomicBool,
     pub overflow: AtomicBool,
@@ -182,11 +192,12 @@ fn monitor(state: &InputState, tx: SyncSender<Message>) {
             let mode = state.mode.load(Ordering::Acquire);
             if mode == IDLE {
                 let bindings = state.bindings.lock().unwrap_or_else(|e| e.into_inner());
-                for (binding, (hotkey, hold, playback)) in bindings.iter().enumerate() {
-                    if *hotkey != code || (!pressed && !hold) {
+                for listened in bindings.iter() {
+                    let Listened { id: binding, hotkey, hold, ref playback } = *listened;
+                    if hotkey != code || (!pressed && !hold) {
                         continue;
                     }
-                    let message = if *hold {
+                    let message = if hold {
                         // The release is still sent: the start may not have happened yet.
                         Message::Hold { binding, pressed }
                     } else {

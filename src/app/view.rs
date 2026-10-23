@@ -318,12 +318,18 @@ impl ClickerApp {
         let c = l.c;
         let editable = self.idle();
         let mut profiles = Row::new().spacing(4);
+        let can_switch = !self.recording && self.selecting_hotkey.is_none();
         for (index, profile) in self.settings.profiles.iter().enumerate() {
             let active = index == self.settings.profile;
+            let name = if profile.enabled {
+                profile.name.clone()
+            } else {
+                format!("{} (off)", profile.name)
+            };
             profiles = profiles.push(
-                button(t(l, profile.name.as_str()))
+                button(t(l, name))
                     .padding([4, 10])
-                    .on_press_maybe(editable.then_some(Message::SelectProfile(index)))
+                    .on_press_maybe(can_switch.then_some(Message::SelectProfile(index)))
                     .style(style::nav_style(c, active)),
             );
         }
@@ -334,7 +340,7 @@ impl ClickerApp {
                 "Delete",
                 Message::DeleteProfile,
                 editable && self.settings.profiles.len() > 1,
-                "Delete the active profile",
+                "Delete this profile",
             ),
         ]
         .spacing(2);
@@ -345,10 +351,17 @@ impl ClickerApp {
             .padding([4, 8])
             .width(240)
             .style(style::text_input_style(c));
+        let enabled = checkbox(self.settings.active().enabled)
+            .label("Listen for this profile's keys")
+            .on_toggle(Message::SetProfileEnabled)
+            .size(18)
+            .text_size(l.size)
+            .font(l.font)
+            .style(style::checkbox_style(c));
         let bindings = &self.settings.active().bindings;
         let mut keys = Column::new();
         for (index, binding) in bindings.iter().enumerate() {
-            let running = self.engines.get(index).is_some_and(Engine::running);
+            let running = self.engine(self.shown(index)).is_some_and(Engine::running);
             let steps = match binding.steps.len() {
                 1 => "1 step".to_string(),
                 n => format!("{n} steps"),
@@ -407,9 +420,10 @@ impl ClickerApp {
             .style(move |_| style::view_area(c));
         let form = column![
             self.form_section("Profile"),
-            self.form_row("Active profile:", column![profiles.wrap(), profile_actions].spacing(6)),
+            self.form_row("Profiles:", column![profiles.wrap(), profile_actions].spacing(6)),
             self.form_row("Name:", name),
-            self.form_hint("Only the active profile's keys are listened for."),
+            self.form_row("Enabled:", enabled),
+            self.form_hint("The keys of every enabled profile work at the same time."),
             space().height(8),
             self.form_section("Keys"),
         ]
@@ -1008,7 +1022,7 @@ impl ClickerApp {
     fn status_bar(&self) -> El<'_> {
         let l = self.look;
         let c = l.c;
-        let running: Vec<_> = self.engines.iter().filter(|engine| engine.running()).collect();
+        let running: Vec<_> = self.all_engines().filter(|engine| engine.running()).collect();
         let (status, tone) = if self.recording {
             ("Recording", c.error)
         } else if running.is_empty() {
@@ -1022,14 +1036,14 @@ impl ClickerApp {
         } else {
             ("Starting", c.neutral)
         };
-        let keys = self
-            .settings
-            .active()
-            .bindings
-            .iter()
-            .map(|binding| key_name(binding.hotkey))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let enabled: Vec<_> = self.settings.profiles.iter().filter(|p| p.enabled).collect();
+        let keys: usize = enabled.iter().map(|profile| profile.bindings.len()).sum();
+        let listening = format!(
+            "{} {} on · {keys} {}",
+            enabled.len(),
+            if enabled.len() == 1 { "profile" } else { "profiles" },
+            if keys == 1 { "key" } else { "keys" },
+        );
         let devices = self.input.status();
         let loops = self.loops();
         let detail = format!(
@@ -1039,7 +1053,7 @@ impl ClickerApp {
         container(
             row![
                 text(status).size(l.size - 1.0).font(bold(l)).color(tone),
-                small(l, format!("{} · {keys}", self.settings.active().name)),
+                small(l, listening),
                 space().width(Length::Fill),
                 small(l, format!("{loops} loops")),
                 vsep(l),

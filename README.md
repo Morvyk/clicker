@@ -14,8 +14,9 @@ works in any Wayland application.
 A profile is a set of keys, each with its own macro: for example Space on
 the side mouse button and E on the extra button. Each key starts and stops
 its macro independently, so several can run at once. Tick *Hold to play* to
-run a macro only while its key is held down. Only the active profile's keys
-are listened for; switch profiles on the Profiles page.
+run a macro only while its key is held down. The keys of every enabled
+profile work at the same time; turn a profile off to stop listening for its
+keys.
 
 ## Build
 

@@ -79,17 +79,24 @@ impl Default for Binding {
     }
 }
 
-/// A named set of bindings. Only the active profile's keys are listened for.
+/// A named set of bindings. Every enabled profile's keys work at once.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub name: String,
+    #[serde(default = "enabled")]
+    pub enabled: bool,
     pub bindings: Vec<Binding>,
+}
+
+fn enabled() -> bool {
+    true
 }
 
 impl Profile {
     pub fn new(name: String) -> Self {
         Self {
             name,
+            enabled: true,
             bindings: vec![Binding::default()],
         }
     }
@@ -102,7 +109,7 @@ pub struct Settings {
     pub parallel: bool,
     pub devices: usize,
     pub profiles: Vec<Profile>,
-    /// The active profile.
+    /// The profile shown on the Profiles and Sequence pages.
     pub profile: usize,
     /// The binding of the active profile shown on the Sequence page.
     pub binding: usize,
@@ -142,8 +149,8 @@ impl Settings {
                 binding.steps = steps;
             }
             self.profiles = vec![Profile {
-                name: "Default".into(),
                 bindings: vec![binding],
+                ..Profile::new("Default".into())
             }];
         }
         if self.profiles.is_empty() {
