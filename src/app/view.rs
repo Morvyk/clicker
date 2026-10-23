@@ -892,6 +892,59 @@ impl ClickerApp {
             .into()
     }
 
+    /// The text test field. The renderer only clips an editor's text when the
+    /// editor is larger than its clip area, so it drew the lines just above and
+    /// below the visible ones outside the field, where they are never
+    /// repainted, and scrolled lines piled up there. The editor is therefore
+    /// 1 px taller than the scroll area that holds it, and the frame around
+    /// that draws the border.
+    fn test_editor(&self) -> El<'_> {
+        const PADDING: f32 = 8.0;
+        let l = self.look;
+        let c = l.c;
+        responsive(move |size| {
+            let height = (size.height - 2.0 * PADDING).max(1.0);
+            // The frame takes the editor's hover and focus status from its last draw.
+            let status = std::rc::Rc::new(std::cell::Cell::new(text_editor::Status::Active));
+            let seen = status.clone();
+            let editor_style = style::text_editor_style(c);
+            let frame_style = style::text_editor_style(c);
+            let editor = text_editor(&self.test_text)
+                .placeholder("Type to test the macro…")
+                .on_action(Message::TextTest)
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                .font(l.mono)
+                .size(l.size)
+                .padding(0)
+                .height(height + 1.0)
+                .style(move |theme, status| {
+                    seen.set(status);
+                    text_editor::Style {
+                        background: iced::Color::TRANSPARENT.into(),
+                        border: iced::Border::default(),
+                        ..editor_style(theme, status)
+                    }
+                });
+            let clip = scrollable(editor)
+                .direction(scrollable::Direction::Vertical(scrollable::Scrollbar::hidden()))
+                .height(height);
+            container(clip)
+                .padding(PADDING)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(move |theme| {
+                    let style = frame_style(theme, status.get());
+                    container::Style {
+                        background: Some(style.background),
+                        border: style.border,
+                        ..container::Style::default()
+                    }
+                })
+                .into()
+        })
+        .into()
+    }
+
     fn test_page(&self) -> El<'_> {
         let l = self.look;
         let c = l.c;
@@ -939,15 +992,7 @@ impl ClickerApp {
                 ]
                 .spacing(12)
                 .align_y(Alignment::Center),
-                text_editor(&self.test_text)
-                    .placeholder("Type to test the macro…")
-                    .on_action(Message::TextTest)
-                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                    .font(l.mono)
-                    .size(l.size)
-                    .padding(8)
-                    .height(Length::Fill)
-                    .style(style::text_editor_style(c)),
+                self.test_editor(),
                 small(l, "Letters per second, counted as characters typed into this field"),
             ]
             .spacing(8)
